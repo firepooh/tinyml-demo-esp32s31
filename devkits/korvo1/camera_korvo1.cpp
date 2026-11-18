@@ -2,7 +2,9 @@
  * @file camera_korvo1.cpp
  * @brief ESP32-S31 Korvo-1 implementation of devkit::Camera.
  *
- * OV3660 on the DVP interface, captured through the V4L2 VFS on /dev/video2.
+ * SC101IOT (1280x720 UYVY, decimated 4:1 to 320x180 in software) or the stock
+ * OV3660 (240x240 RGB565_BE) on the DVP interface — whichever sensor
+ * devkits/korvo1/sdkconfig.defaults selects — captured through the V4L2 VFS.
  * One still frame per capture: open, negotiate the format, stream one buffer
  * into a pre-allocated PSRAM buffer (USERPTR), stop, close. The buffers are
  * allocated once in the constructor and reused.
@@ -54,13 +56,91 @@ constexpr const char *TAG = "camera";
  * DEFAULT_FMT symbol says what the driver will actually deliver. A mode added to
  * sdkconfig.defaults therefore fails the build here until its geometry is
  * declared (issue #61). */
-#if CONFIG_CAMERA_OV3660_DVP_DEFAULT_FMT_RGB565_BE_240X240_24FPS
-constexpr uint32_t FRAME_W   = 240;
-constexpr uint32_t FRAME_H   = 240;
-constexpr uint32_t FRAME_BPP = 2;   /* RGB565 */
+#if CONFIG_CAMERA_SC101IOT
+/* SC101IOT: its only DVP modes are 1280x720 YUV 4:2:2. It has no RGB565 mode
+ * and this devkit has no scaler in the path, so both conversions decimate the
+ * frame 4:1 in software (4x4 box average) to 320x180 — the same output geometry
+ * the ESP-Mosaico produces from the same sensor. */
+#if CONFIG_CAMERA_SC101IOT_DVP_DEFAULT_FMT_YUV422_1280X720_15FPS || \
+    CONFIG_CAMERA_SC101IOT_DVP_DEFAULT_FMT_YUV422_1280X720_25FPS
+constexpr uint32_t    FRAME_W      = 1280;
+constexpr uint32_t    FRAME_H      = 720;
+constexpr uint32_t    FRAME_BPP    = 2;   /* UYVY */
+constexpr FrameFormat FRAME_FORMAT = FrameFormat::UYVY;
+constexpr uint32_t    SCALE        = 4;
+/* Mounting orientation of the SC101IOT module on this board is not verified on
+ * hardware yet. If the picture comes out upside-down or mirrored, flip these. */
+constexpr bool        kFlipRows    = false;
+constexpr bool        kMirrorCols  = false;
 #else
-#error "camera_korvo1.cpp: the OV3660 DVP default format selected in devkits/korvo1/sdkconfig.defaults is not handled — declare its frame geometry and pixel format here"
+#error "camera_korvo1.cpp: only the SC101IOT UYVY 1280x720 modes are handled — select CONFIG_CAMERA_SC101IOT_DVP_DEFAULT_FMT_YUV422_1280X720_15FPS"
 #endif
+#elif CONFIG_CAMERA_OV3660_DVP_DEFAULT_FMT_RGB565_BE_240X240_24FPS
+constexpr uint32_t    FRAME_W      = 240;
+constexpr uint32_t    FRAME_H      = 240;
+constexpr uint32_t    FRAME_BPP    = 2;   /* RGB565 */
+constexpr FrameFormat FRAME_FORMAT = FrameFormat::RGB565_BE;
+constexpr uint32_t    SCALE        = 1;
+/* The OV3660 is mounted upside-down relative to the scene (issue #45). */
+constexpr bool        kFlipRows    = true;
+constexpr bool        kMirrorCols  = false;
+#else
+#error "camera_korvo1.cpp: the camera DVP default format selected in devkits/korvo1/sdkconfig.defaults is not handled — declare its frame geometry and pixel format here"
+#endif
+
+/* The geometry both conversions are produced at. */
+constexpr uint32_t OUT_W = FRAME_W / SCALE;
+constexpr uint32_t OUT_H = FRAME_H / SCALE;
+static_assert(FRAME_W % SCALE == 0 && FRAME_H % SCALE == 0,
+              "the decimation factor must divide the frame");
+static_assert(FRAME_FORMAT != FrameFormat::UYVY || (SCALE % 2) == 0,
+              "a UYVY box must cover whole U-Y-V-Y macro-pixels");
+
+/**
+ * One output pixel as 8-bit R, G, B, read from the frame at output coordinate
+ * (ox, oy). Orientation correction (row flip / column mirror) and decimation
+ * both happen here, so the two conversions below cannot disagree.
+ */
+inline void sample_rgb(const uint8_t *data, uint32_t stride,
+                       uint32_t out_w, uint32_t out_h,
+                       uint32_t ox, uint32_t oy,
+                       uint8_t &r, uint8_t &g, uint8_t &b)
+{
+    const uint32_t sx = (kMirrorCols ? (out_w - 1 - ox) : ox) * SCALE;
+    const uint32_t sy = (kFlipRows ? (out_h - 1 - oy) : oy) * SCALE;
+
+    if constexpr (FRAME_FORMAT == FrameFormat::UYVY) {
+        /* Box average over SCALE x SCALE pixels: each row of the box is
+         * SCALE/2 macro-pixels U Y0 V Y1. */
+        uint32_t ys = 0, us = 0, vs = 0;
+        for (uint32_t dy = 0; dy < SCALE; dy++) {
+            const uint8_t *p = data + (size_t)(sy + dy) * stride + (size_t)sx * 2;
+            for (uint32_t m = 0; m < SCALE / 2; m++, p += 4) {
+                us += p[0];
+                ys += p[1] + p[3];
+                vs += p[2];
+            }
+        }
+        const int y = static_cast<int>(ys / (SCALE * SCALE));
+        const int u = static_cast<int>(us / (SCALE * SCALE / 2)) - 128;
+        const int v = static_cast<int>(vs / (SCALE * SCALE / 2)) - 128;
+
+        /* BT.601 full range, 8.8 fixed point. */
+        auto clamp = [](int x) {
+            return static_cast<uint8_t>(x < 0 ? 0 : (x > 255 ? 255 : x));
+        };
+        r = clamp(y + ((359 * v) >> 8));
+        g = clamp(y - ((88 * u + 183 * v) >> 8));
+        b = clamp(y + ((454 * u) >> 8));
+    } else {
+        /* RGB565 big-endian, read field by field (no byte swap needed). */
+        const uint8_t *p = data + (size_t)sy * stride + (size_t)sx * 2;
+        const uint16_t v = ((uint16_t)p[0] << 8) | p[1];
+        r = (v >> 8) & 0xf8;
+        g = (v >> 3) & 0xfc;
+        b = (v << 3) & 0xf8;
+    }
+}
 
 /* ---- This devkit's capture policy ---------------------------------------
  *
@@ -89,8 +169,9 @@ constexpr uint32_t kDequeueTimeoutMs = KORVO1_DQBUF_TIMEOUT_MS;
  * driver bound, so it is derived from it rather than written a second time. */
 constexpr int kPollTimeoutMs = static_cast<int>(kDequeueTimeoutMs);
 
-/* One full frame per USERPTR slot. */
-constexpr int kBufferCount = 3;
+/* One full frame per USERPTR slot. A 1280x720 UYVY frame is 1.8 MB, so the
+ * large sensor mode keeps two slots instead of three to save PSRAM. */
+constexpr int kBufferCount = (FRAME_W * FRAME_H * FRAME_BPP > 1024u * 1024u) ? 2 : 3;
 
 /* Auto-exposure settle: the ramp is converged by the minimum number of frames;
  * agreement means the mean luma moved by no more than this percentage. */
@@ -140,10 +221,12 @@ public:
         }
         fb_size_ = total;
 
-        ESP_LOGI(TAG, "Frame buffer: %lu bytes, %d x %lux%lu RGB565 (%lu bytes/frame)",
+        ESP_LOGI(TAG, "Frame buffer: %lu bytes, %d x %lux%lu %s (%lu bytes/frame), output %lux%lu",
                  (unsigned long)fb_size_, camera_policy::kBufferCount,
                  (unsigned long)FRAME_W, (unsigned long)FRAME_H,
-                 (unsigned long)frame_bytes);
+                 FRAME_FORMAT == FrameFormat::UYVY ? "UYVY" : "RGB565",
+                 (unsigned long)frame_bytes,
+                 (unsigned long)OUT_W, (unsigned long)OUT_H);
     }
 
     ~CameraKorvo1() override
@@ -161,7 +244,7 @@ public:
      * geometry, selected by this devkit's sdkconfig.defaults (the OV3660 DVP
      * mode configured there), and the detector resizes for its model itself.
      */
-    Geometry geometry() const override { return Geometry{FRAME_W, FRAME_H}; }
+    Geometry geometry() const override { return Geometry{OUT_W, OUT_H}; }
 
     esp_err_t capture(Frame &out) override
     {
@@ -302,15 +385,23 @@ public:
         esp_err_t ret = ESP_OK;
         {
             auto mean_luma = [](const uint8_t *p, uint32_t pixels) {
+                /* Every 8th pixel is enough for an exposure trend, and keeps
+                 * the 1280x720 mode from spending its frame time here. */
+                constexpr uint32_t kStep = 8;
                 uint32_t sum = 0;
-                for (uint32_t i = 0; i < pixels; i++) {
-                    const uint16_t v = ((uint16_t)p[i * 2] << 8) | p[i * 2 + 1];
-                    const uint32_t r = (v >> 8) & 0xf8;
-                    const uint32_t g = (v >> 3) & 0xfc;
-                    const uint32_t b = (v << 3) & 0xf8;
-                    sum += (r * 77 + g * 150 + b * 29) >> 8;
+                uint32_t n   = 0;
+                for (uint32_t i = 0; i < pixels; i += kStep, n++) {
+                    if constexpr (FRAME_FORMAT == FrameFormat::UYVY) {
+                        sum += p[i * 2 + 1];   /* Y of a U-Y-V-Y pair */
+                    } else {
+                        const uint16_t v = ((uint16_t)p[i * 2] << 8) | p[i * 2 + 1];
+                        const uint32_t r = (v >> 8) & 0xf8;
+                        const uint32_t g = (v >> 3) & 0xfc;
+                        const uint32_t b = (v << 3) & 0xf8;
+                        sum += (r * 77 + g * 150 + b * 29) >> 8;
+                    }
                 }
-                return sum / pixels;
+                return (n != 0) ? sum / n : 0u;
             };
 
             struct v4l2_buffer buf;
@@ -403,7 +494,7 @@ public:
                 out.geometry = Geometry{w, h};
                 out.stride   = stride;
                 out.bytes    = img_size;
-                out.format   = FrameFormat::RGB565_BE;
+                out.format   = FRAME_FORMAT;
             }
         }
 
@@ -418,13 +509,13 @@ public:
     }
 
     /**
-     * Packed RGB888 for the detector, at the captured geometry: R, G, B from
-     * the lowest address (PixelOrder::RGB), rows written bottom-up.
+     * Packed RGB888 for the detector, at geometry(): R, G, B from the lowest
+     * address (PixelOrder::RGB). Decimation, colour conversion and orientation
+     * are all in sample_rgb(), shared with to_display().
      *
-     * This devkit has no scaler, so the frame's own size is what comes back and
-     * the detector resizes for the model itself. The RGB565_BE fields are read
-     * directly (no byte swap), but the rows are flipped: the sensor is mounted
-     * upside-down relative to the scene, which is also why to_display() flips.
+     * OV3660: the frame's own size, rows flipped — the sensor is mounted
+     * upside-down relative to the scene. SC101IOT: 1280x720 boxed down to
+     * 320x180; the detector resizes for the model itself.
      *
      * Measured on this devkit (issue #45): with the rows flipped, a person in
      * front of the lens detects as person at 0.88; without the flip the same
@@ -434,56 +525,56 @@ public:
      */
     esp_err_t to_model_input(const Frame &src, ModelImage &out) override
     {
-        esp_err_t ret = camera::validate_frame(src, FrameFormat::RGB565_BE,
-                                               "to_model_input");
+        esp_err_t ret = camera::validate_frame(src, FRAME_FORMAT, "to_model_input");
         if (ret != ESP_OK) {
             return ret;
         }
 
-        const uint32_t needed = src.geometry.width * src.geometry.height * 3u;
+        /* Output geometry: the frame decimated by SCALE (1 for the OV3660). */
+        const uint32_t w      = src.geometry.width / SCALE;
+        const uint32_t h      = src.geometry.height / SCALE;
+        const uint32_t needed = w * h * 3u;
         ret = rgb_.reserve(needed, "RGB888");
         if (ret != ESP_OK) {
             return ret;
         }
 
-        const uint32_t w            = src.geometry.width;
-        const uint32_t h            = src.geometry.height;
-        const uint32_t src_stride   = (src.stride != 0) ? src.stride : w * 2u;
-        uint8_t       *dst          = rgb_.data();
+        const uint32_t src_stride = (src.stride != 0) ? src.stride
+                                                      : src.geometry.width * FRAME_BPP;
+        uint8_t       *dst        = rgb_.data();
 
         for (uint32_t y = 0; y < h; y++) {
-            const uint8_t *srow = src.data + (size_t)(h - 1 - y) * src_stride;
-            uint8_t       *drow = dst + (size_t)y * w * 3;
+            uint8_t *drow = dst + (size_t)y * w * 3;
             for (uint32_t x = 0; x < w; x++) {
-                const uint16_t p = ((uint16_t)srow[x * 2] << 8) | srow[x * 2 + 1];
-                drow[x * 3 + 0] = (p >> 8) & 0xf8;
-                drow[x * 3 + 1] = (p >> 3) & 0xfc;
-                drow[x * 3 + 2] = (p << 3) & 0xf8;
+                sample_rgb(src.data, src_stride, w, h, x, y,
+                           drow[x * 3 + 0], drow[x * 3 + 1], drow[x * 3 + 2]);
             }
         }
 
         /* R at the lowest address: the software loop above writes it first. */
-        camera::fill_model_image(out, dst, src.geometry, w * 3u, needed,
+        camera::fill_model_image(out, dst, Geometry{w, h}, w * 3u, needed,
                                  PixelOrder::RGB);
         return ESP_OK;
     }
 
     /**
-     * The panel's view of the frame: RGB565 little-endian for LVGL, rows
-     * reversed because the OV3660 is mounted upside-down on this board. Same
-     * geometry contract as to_model_input(): no scaler here, so the frame's own
-     * size comes back.
+     * The panel's view of the frame: RGB565 little-endian for LVGL, at the same
+     * geometry and orientation as to_model_input(), so the detector's boxes land
+     * 1:1 on this image.
      */
     esp_err_t to_display(const Frame &src, DisplayImage &out) override
     {
-        esp_err_t ret = camera::validate_frame(src, FrameFormat::RGB565_BE,
-                                               "to_display");
+        esp_err_t ret = camera::validate_frame(src, FRAME_FORMAT, "to_display");
         if (ret != ESP_OK) {
             return ret;
         }
 
-        const uint32_t row_bytes    = src.geometry.width * FRAME_BPP;
-        const uint32_t needed_bytes = row_bytes * src.geometry.height;
+        const uint32_t w            = src.geometry.width / SCALE;
+        const uint32_t h            = src.geometry.height / SCALE;
+        const uint32_t row_bytes    = w * 2u;   /* RGB565 */
+        const uint32_t needed_bytes = row_bytes * h;
+        const uint32_t src_stride   = (src.stride != 0) ? src.stride
+                                                        : src.geometry.width * FRAME_BPP;
 
         ret = disp_.reserve(needed_bytes, "display");
         if (ret != ESP_OK) {
@@ -491,18 +582,21 @@ public:
         }
         uint8_t *dst = disp_.data();
 
-        for (uint32_t y = 0; y < src.geometry.height; y++) {
-            /* Row flip: bottom row first */
-            const uint8_t *sr = src.data + (src.geometry.height - 1 - y) * row_bytes;
-            uint8_t       *dr = dst + y * row_bytes;
-            for (uint32_t x = 0; x < src.geometry.width; x++) {
-                /* Byte swap: RGB565 BE -> LE */
-                dr[x * 2]     = sr[x * 2 + 1];
-                dr[x * 2 + 1] = sr[x * 2];
+        for (uint32_t y = 0; y < h; y++) {
+            uint8_t *dr = dst + (size_t)y * row_bytes;
+            for (uint32_t x = 0; x < w; x++) {
+                uint8_t r, g, b;
+                sample_rgb(src.data, src_stride, w, h, x, y, r, g, b);
+                /* RGB565 little-endian. For the OV3660 this reproduces the
+                 * plain BE -> LE byte swap bit for bit. */
+                const uint16_t v = (uint16_t)(((r & 0xf8) << 8) |
+                                              ((g & 0xfc) << 3) | (b >> 3));
+                dr[x * 2]     = (uint8_t)(v & 0xff);
+                dr[x * 2 + 1] = (uint8_t)(v >> 8);
             }
         }
 
-        camera::fill_display_image(out, dst, src.geometry, row_bytes, needed_bytes);
+        camera::fill_display_image(out, dst, Geometry{w, h}, row_bytes, needed_bytes);
         return ESP_OK;
     }
 

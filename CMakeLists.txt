@@ -120,4 +120,8 @@ project(tinyml-demo-esp32s31)
 # vision/image/dl_image_bmp.cpp and IDF builds with -Werror, so the build fails.
 # Demote it to a warning (it still prints) build-wide instead of editing the
 # third-party component.  See issue #33.
-idf_build_set_property(CXX_COMPILE_OPTIONS "-Wno-error=non-c-typedef-for-linkage" APPEND)
+# GCC 15 (the ESP-IDF v6.1 toolchain) does not know the option and rejects it,
+# so it is only added for GCC 16 and later.
+if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+    idf_build_set_property(CXX_COMPILE_OPTIONS "-Wno-error=non-c-typedef-for-linkage" APPEND)
+endif()

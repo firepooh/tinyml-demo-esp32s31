@@ -2,8 +2,9 @@
 dependencies:
   ## Required IDF version — the ESP-IDF 6.2 development line
   ## (espressif/idf:latest, named in .devcontainer/devcontainer.json).
+  ## Local build: relaxed to 6.1 so the installed ESP-IDF v6.1 release can build it.
   idf:
-    version: ">=6.2"
+    version: ">=6.1"
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"
