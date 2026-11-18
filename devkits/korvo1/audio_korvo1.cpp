@@ -11,6 +11,7 @@
 #include "devkit.hpp"
 
 #include "bsp/esp32_s31_korvo_1.h"
+#include "esp_codec_dev_defaults.h"     /* es8389_codec_new, audio_codec_new_i2c_ctrl */
 
 #include "esp_log.h"
 #include <new>
@@ -83,9 +84,9 @@ public:
 
     esp_err_t open_mic() override
     {
-        mic_dev_ = bsp_audio_codec_microphone_init();
+        mic_dev_ = create_mic_codec();
         if (mic_dev_ == nullptr) {
-            ESP_LOGE(TAG, "bsp_audio_codec_microphone_init failed");
+            ESP_LOGE(TAG, "microphone codec creation failed");
             return ESP_FAIL;
         }
 
@@ -134,6 +135,52 @@ public:
     float afe_linear_gain() const override { return AFE_LINEAR_GAIN; }
 
 private:
+    /* The BSP's bsp_audio_codec_microphone_init() (esp32_s31_korvo_1 1.0.1)
+     * creates the ES8389 with every option left at its default, so the codec
+     * runs from BCLK (use_mclk = false) with the DAC reference enabled
+     * (no_dac_ref = false). In that mode esp_codec_dev 1.5.9's
+     * es8389_config_sample() sizes the clock dividers for a BCLK of
+     * rate x bits x 4 = 1.024 MHz, but the BSP's I2S STD bus carries two 16-bit
+     * slots, so the real BCLK is rate x bits x 2 = 512 kHz. The ADC then runs at
+     * half rate: every sample reaches the AFE twice (measured: 100% of sample
+     * pairs identical), WakeNet sees 8 kHz audio and never triggers.
+     *
+     * This app never uses the DAC reference (the AFE is fed "M", ref = 0), so the
+     * codec is created here with no_dac_ref = true. The divider table is then
+     * indexed by rate x bits x 2 = 512 kHz, which matches the bus. Everything
+     * else mirrors the BSP's own function. */
+    static esp_codec_dev_handle_t create_mic_codec()
+    {
+        const audio_codec_data_if_t *data_if = bsp_audio_get_codec_itf();
+        if (data_if == nullptr) {
+            ESP_LOGE(TAG, "I2S data interface missing - bsp_audio_init() not run?");
+            return nullptr;
+        }
+
+        audio_codec_i2c_cfg_t i2c_cfg = {};
+        i2c_cfg.port       = BSP_I2C_NUM;
+        i2c_cfg.addr       = ES8389_CODEC_DEFAULT_ADDR;
+        i2c_cfg.bus_handle = bsp_i2c_get_handle();
+        const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+        if (ctrl_if == nullptr) {
+            return nullptr;
+        }
+
+        es8389_codec_cfg_t codec_cfg = {};
+        codec_cfg.ctrl_if    = ctrl_if;
+        codec_cfg.no_dac_ref = true;
+        const audio_codec_if_t *codec_if = es8389_codec_new(&codec_cfg);
+        if (codec_if == nullptr) {
+            return nullptr;
+        }
+
+        esp_codec_dev_cfg_t dev_cfg = {};
+        dev_cfg.dev_type = ESP_CODEC_DEV_TYPE_IN;
+        dev_cfg.codec_if = codec_if;
+        dev_cfg.data_if  = data_if;
+        return esp_codec_dev_new(&dev_cfg);
+    }
+
     esp_codec_dev_handle_t mic_dev_ = nullptr;
     bool                   init_ok_  = false;
 };
